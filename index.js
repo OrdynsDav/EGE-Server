@@ -501,7 +501,13 @@ app.post("/profile/answer", authMiddleware, (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
+// Vercel (@vercel/node) expects the module to export a handler/app.
+// For local development we still start the server with app.listen().
+export default app;
+
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`Server running at http://localhost:${PORT}`);
+  });
+}
