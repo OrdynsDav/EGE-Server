@@ -72,13 +72,24 @@ async function ensureTables() {
       );
     `);
 
-    // Если таблица пустая, один раз заливаем данные из локального words.json
-    const countRes = await client.query("SELECT COUNT(*)::int AS count FROM words");
-    if (countRes.rows[0]?.count === 0) {
-      try {
-        const raw = fs.readFileSync(WORDS_PATH, "utf8");
-        const data = JSON.parse(raw);
-        const initialWords = Array.isArray(data.words) ? data.words : [];
+    // Синхронизируем таблицу words с локальным words.json:
+    // добавляем недостающие базовые слова, уже существующие не трогаем.
+    try {
+      const raw = fs.readFileSync(WORDS_PATH, "utf8");
+      const data = JSON.parse(raw);
+      const initialWords = Array.isArray(data.words) ? data.words : [];
+
+      if (initialWords.length > 0) {
+        const existingRes = await client.query(
+          "SELECT accent, stress_index FROM words"
+        );
+        const existingSet = new Set(
+          existingRes.rows.map(
+            (r) => `${String(r.accent).trim().toLowerCase()}:${r.stress_index}`
+          )
+        );
+
+        let inserted = 0;
         for (const w of initialWords) {
           if (
             !w ||
@@ -87,15 +98,23 @@ async function ensureTables() {
           ) {
             continue;
           }
+          const key = `${w.accent.trim().toLowerCase()}:${w.stress_index}`;
+          if (existingSet.has(key)) continue;
+
           await client.query(
             "INSERT INTO words (accent, stress_index) VALUES ($1, $2)",
             [w.accent.trim().toLowerCase(), w.stress_index]
           );
+          existingSet.add(key);
+          inserted++;
         }
-        console.log(`Seeded ${initialWords.length} words into Postgres`);
-      } catch (seedErr) {
-        console.error("Failed to seed initial words from words.json", seedErr);
+
+        if (inserted > 0) {
+          console.log(`Seeded ${inserted} base words into Postgres`);
+        }
       }
+    } catch (seedErr) {
+      console.error("Failed to seed initial words from words.json", seedErr);
     }
 
     await client.query(`
