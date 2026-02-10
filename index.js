@@ -376,7 +376,7 @@ app.post("/auth/forgot-password", (req, res) => {
 
     if (!user) {
       // To avoid leaking which accounts exist, respond with generic message
-      return res.json({ message: "If the account exists, a code has been sent" });
+      return res.json({ message: "Если учетная запись существует, то код был отправлен" });
     }
 
     const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
@@ -390,10 +390,10 @@ app.post("/auth/forgot-password", (req, res) => {
     // Here you would actually send email or SMS. For now we log it.
     console.log(`Password reset code for user ${user.name} via ${method}: ${code}`);
 
-    return res.json({ message: "If the account exists, a code has been sent" });
+    return res.json({ message: "Если учетная запись существует, то код был отправлен" });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to start password reset" });
+    res.status(500).json({ error: "Не удалось запустить сброс пароля" });
   }
 });
 
