@@ -46,7 +46,7 @@
     },
     {
       "accent": "аккомпаниатор",
-      "stress_index": 11
+      "stress_index": 9
     },
     {
       "accent": "аннотация",
@@ -214,7 +214,7 @@
     },
     {
       "accent": "валовой",
-      "stress_index": 6
+      "stress_index": 5
     },
     {
       "accent": "ветеран",
@@ -241,14 +241,6 @@
       "stress_index": 5
     },
     {
-      "accent": "дефис",
-      "stress_index": 1
-    },
-    {
-      "accent": "дешевизна",
-      "stress_index": 8
-    },
-    {
       "accent": "диспансер",
       "stress_index": 7
     },
@@ -269,10 +261,6 @@
       "stress_index": 4
     },
     {
-      "accent": "еретик",
-      "stress_index": 2
-    },
-    {
       "accent": "жалюзи",
       "stress_index": 5
     },
@@ -283,14 +271,6 @@
     {
       "accent": "заговор",
       "stress_index": 1
-    },
-    {
-      "accent": "закупорить",
-      "stress_index": 5
-    },
-    {
-      "accent": "запломбировать",
-      "stress_index": 7
     },
     {
       "accent": "звонит",
