@@ -12,7 +12,29 @@ const SESSIONS_PATH = path.join(__dirname, "sessions.json");
 const TOKEN_COOKIE_NAME = "auth_token";
 
 const app = express();
-app.use(cors({ credentials: true, origin: true }));
+
+// Явно указываем, с каких доменов можно ходить с куками
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://ege-vocabulary.vercel.app",
+];
+
+app.use(
+  cors({
+    credentials: true,
+    origin(origin, callback) {
+      // Для server-to-server или curl без Origin — просто разрешаем
+      if (!origin) return callback(null, true);
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
+  })
+);
+
 app.use(express.json());
 
 // -------- Words helpers --------
