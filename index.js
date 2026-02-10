@@ -4,6 +4,9 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { randomBytes, scryptSync, timingSafeEqual } from "crypto";
+import pkg from "pg";
+
+const { Pool } = pkg;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORDS_PATH = path.join(__dirname, "words.json");
@@ -37,52 +40,119 @@ app.use(
 
 app.use(express.json());
 
-// -------- Words helpers --------
+// -------- Postgres pool --------
+// Используем Neon URL из переменной окружения, созданной интеграцией.
+// Если когда-нибудь переименуешь переменную, просто поправь здесь.
 
-function readWords() {
-  const raw = fs.readFileSync(WORDS_PATH, "utf8");
-  const data = JSON.parse(raw);
-  return data.words || [];
+const connectionString =
+  process.env.EGE_STORGAE_DATABASE_URL ||
+  process.env.EGE_STORGAE_POSTGRES_URL_NON_POOLING ||
+  process.env.EGE_STORGAE_DATABASE_URL_UNPOOLED;
+
+if (!connectionString) {
+  console.warn(
+    "Postgres connection string is not set. Please configure EGE_STORGAE_DATABASE_URL in Vercel."
+  );
 }
 
-function writeWords(words) {
-  fs.writeFileSync(WORDS_PATH, JSON.stringify({ words }, null, 2), "utf8");
-}
+const pool = new Pool({
+  connectionString,
+  max: 5,
+  idleTimeoutMillis: 30_000,
+});
 
-// -------- User & session storage (file-based) --------
-
-function readUsers() {
+async function ensureTables() {
+  const client = await pool.connect();
   try {
-    const raw = fs.readFileSync(USERS_PATH, "utf8");
-    const data = JSON.parse(raw);
-    return data.users || [];
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      return [];
-    }
-    throw err;
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS words (
+        id SERIAL PRIMARY KEY,
+        accent TEXT NOT NULL,
+        stress_index INTEGER NOT NULL
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        email TEXT UNIQUE,
+        phone TEXT UNIQUE,
+        password_hash TEXT NOT NULL,
+        best_streak INTEGER NOT NULL DEFAULT 0,
+        current_streak INTEGER NOT NULL DEFAULT 0,
+        wrong_words TEXT[] NOT NULL DEFAULT '{}',
+        reset_code TEXT,
+        reset_code_expires_at TIMESTAMPTZ
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ
+      );
+    `);
+  } finally {
+    client.release();
   }
 }
 
-function writeUsers(users) {
-  fs.writeFileSync(USERS_PATH, JSON.stringify({ users }, null, 2), "utf8");
+// Запускаем миграцию при старте (на Vercel — на каждом холодном старте, что ок).
+ensureTables().catch((err) => {
+  console.error("Failed to ensure tables", err);
+});
+
+// -------- Words helpers (Postgres) --------
+
+async function readWords() {
+  const result = await pool.query("SELECT accent, stress_index FROM words ORDER BY id ASC");
+  return result.rows;
 }
 
-function readSessions() {
+async function writeWords(words) {
+  // Простой вариант: очищаем и вставляем заново.
+  const client = await pool.connect();
   try {
-    const raw = fs.readFileSync(SESSIONS_PATH, "utf8");
-    const data = JSON.parse(raw);
-    return data.sessions || [];
-  } catch (err) {
-    if (err.code === "ENOENT") {
-      return [];
+    await client.query("BEGIN");
+    await client.query("TRUNCATE TABLE words");
+    for (const w of words) {
+      await client.query(
+        "INSERT INTO words (accent, stress_index) VALUES ($1, $2)",
+        [w.accent, w.stress_index]
+      );
     }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
     throw err;
+  } finally {
+    client.release();
   }
 }
 
-function writeSessions(sessions) {
-  fs.writeFileSync(SESSIONS_PATH, JSON.stringify({ sessions }, null, 2), "utf8");
+// -------- User & session storage (Postgres) --------
+
+async function readUsers() {
+  const result = await pool.query("SELECT * FROM users");
+  return result.rows;
+}
+
+// writeUsers больше не нужен для полноты, но оставим на случай,
+// если где-то останется вызов. Просто ничего не делает.
+async function writeUsers() {
+  return;
+}
+
+async function readSessions() {
+  const result = await pool.query("SELECT * FROM sessions");
+  return result.rows;
+}
+
+async function writeSessions() {
+  return;
 }
 
 // -------- Password hashing --------
@@ -142,36 +212,43 @@ function getAuthTokenFromRequest(req) {
   return cookies[TOKEN_COOKIE_NAME] || null;
 }
 
-function getUserFromToken(req) {
+async function getUserFromToken(req) {
   const token = getAuthTokenFromRequest(req);
   if (!token) return null;
 
-  const sessions = readSessions();
-  const now = Date.now();
-  const session = sessions.find(
-    (s) => s.token === token && (!s.expiresAt || new Date(s.expiresAt).getTime() > now)
+  const now = new Date();
+  const sessionResult = await pool.query(
+    `SELECT * FROM sessions WHERE token = $1 AND (expires_at IS NULL OR expires_at > $2)`,
+    [token, now]
   );
-  if (!session) return null;
+  if (sessionResult.rowCount === 0) return null;
+  const session = sessionResult.rows[0];
 
-  const users = readUsers();
-  const user = users.find((u) => u.id === session.userId);
-  return user || null;
+  const userResult = await pool.query(`SELECT * FROM users WHERE id = $1`, [session.user_id]);
+  if (userResult.rowCount === 0) return null;
+
+  return userResult.rows[0];
 }
 
-function authMiddleware(req, res, next) {
-  const user = getUserFromToken(req);
-  if (!user) {
-    return res.status(401).json({ error: "Not authenticated" });
+async function authMiddleware(req, res, next) {
+  try {
+    const user = await getUserFromToken(req);
+    if (!user) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    console.error("authMiddleware error", err);
+    return res.status(500).json({ error: "Auth check failed" });
   }
-  req.user = user;
-  next();
 }
 
 // -------- Words routes --------
 
-app.get("/words", (req, res) => {
+app.get("/words", async (req, res) => {
   try {
-    const words = readWords();
+    const words = await readWords();
     res.json({ words });
   } catch (err) {
     console.error(err);
@@ -179,15 +256,18 @@ app.get("/words", (req, res) => {
   }
 });
 
-app.post("/words", (req, res) => {
+app.post("/words", async (req, res) => {
   try {
     const { accent, stress_index } = req.body;
     if (typeof accent !== "string" || typeof stress_index !== "number") {
       return res.status(400).json({ error: "Need accent (string) and stress_index (number)" });
     }
-    const words = readWords();
-    words.push({ accent: accent.trim().toLowerCase(), stress_index });
-    writeWords(words);
+    const normalizedAccent = accent.trim().toLowerCase();
+    await pool.query("INSERT INTO words (accent, stress_index) VALUES ($1, $2)", [
+      normalizedAccent,
+      stress_index,
+    ]);
+    const words = await readWords();
     res.status(201).json({ words });
   } catch (err) {
     console.error(err);
@@ -195,10 +275,10 @@ app.post("/words", (req, res) => {
   }
 });
 
-// -------- Auth routes --------
+// -------- Auth routes (Postgres) --------
 
 // Registration via email or phone
-app.post("/auth/register", (req, res) => {
+app.post("/auth/register", async (req, res) => {
   try {
     const { name, password, email, phone } = req.body || {};
 
@@ -220,42 +300,53 @@ app.post("/auth/register", (req, res) => {
       return res.status(400).json({ error: "Invalid phone format" });
     }
 
-    const users = readUsers();
     const normalizedName = name.trim();
     const normalizedEmail = email ? String(email).trim().toLowerCase() : null;
     const normalizedPhone = phone ? String(phone).trim() : null;
 
-    if (users.some((u) => u.name === normalizedName)) {
+    const existingByName = await pool.query(
+      "SELECT 1 FROM users WHERE name = $1 LIMIT 1",
+      [normalizedName]
+    );
+    if (existingByName.rowCount > 0) {
       return res.status(409).json({ error: "User with this name already exists" });
     }
-    if (normalizedEmail && users.some((u) => u.email === normalizedEmail)) {
-      return res.status(409).json({ error: "User with this email already exists" });
-    }
-    if (normalizedPhone && users.some((u) => u.phone === normalizedPhone)) {
-      return res.status(409).json({ error: "User with this phone already exists" });
+
+    if (normalizedEmail) {
+      const existingByEmail = await pool.query(
+        "SELECT 1 FROM users WHERE email = $1 LIMIT 1",
+        [normalizedEmail]
+      );
+      if (existingByEmail.rowCount > 0) {
+        return res.status(409).json({ error: "User with this email already exists" });
+      }
     }
 
-    const newUser = {
-      id: randomBytes(12).toString("hex"),
+    if (normalizedPhone) {
+      const existingByPhone = await pool.query(
+        "SELECT 1 FROM users WHERE phone = $1 LIMIT 1",
+        [normalizedPhone]
+      );
+      if (existingByPhone.rowCount > 0) {
+        return res.status(409).json({ error: "User with this phone already exists" });
+      }
+    }
+
+    const id = randomBytes(12).toString("hex");
+    const passwordHash = hashPassword(password);
+
+    await pool.query(
+      `INSERT INTO users
+        (id, name, email, phone, password_hash, best_streak, current_streak, wrong_words)
+       VALUES ($1,$2,$3,$4,$5,0,0,'{}')`,
+      [id, normalizedName, normalizedEmail, normalizedPhone, passwordHash]
+    );
+
+    return res.status(201).json({
+      id,
       name: normalizedName,
       email: normalizedEmail,
       phone: normalizedPhone,
-      passwordHash: hashPassword(password),
-      bestStreak: 0,
-      currentStreak: 0,
-      wrongWords: [],
-      resetCode: null,
-      resetCodeExpiresAt: null,
-    };
-
-    users.push(newUser);
-    writeUsers(users);
-
-    return res.status(201).json({
-      id: newUser.id,
-      name: newUser.name,
-      email: newUser.email,
-      phone: newUser.phone,
     });
   } catch (err) {
     console.error(err);
@@ -264,7 +355,7 @@ app.post("/auth/register", (req, res) => {
 });
 
 // Login: check identifier (name/email/phone) + password, return token in httpOnly cookie
-app.post("/auth/login", (req, res) => {
+app.post("/auth/login", async (req, res) => {
   try {
     const { name, email, phone, password } = req.body || {};
 
@@ -275,40 +366,37 @@ app.post("/auth/login", (req, res) => {
       return res.status(400).json({ error: "Name, email or phone is required" });
     }
 
-    const users = readUsers();
-    let user = null;
-
+    let userResult;
     if (email) {
       const normalizedEmail = String(email).trim().toLowerCase();
-      user = users.find((u) => u.email === normalizedEmail);
+      userResult = await pool.query("SELECT * FROM users WHERE email = $1", [normalizedEmail]);
     } else if (phone) {
       const normalizedPhone = String(phone).trim();
-      user = users.find((u) => u.phone === normalizedPhone);
+      userResult = await pool.query("SELECT * FROM users WHERE phone = $1", [normalizedPhone]);
     } else if (name) {
       const normalizedName = String(name).trim();
-      user = users.find((u) => u.name === normalizedName);
+      userResult = await pool.query("SELECT * FROM users WHERE name = $1", [normalizedName]);
     }
 
-    if (!user) {
+    if (!userResult || userResult.rowCount === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const validPassword = verifyPassword(password, user.passwordHash);
+    const user = userResult.rows[0];
+
+    const validPassword = verifyPassword(password, user.password_hash);
     if (!validPassword) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
     const token = createSessionToken();
-    const sessions = readSessions();
-
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-    sessions.push({
-      token,
-      userId: user.id,
-      createdAt: new Date().toISOString(),
-      expiresAt: expiresAt.toISOString(),
-    });
-    writeSessions(sessions);
+
+    await pool.query(
+      `INSERT INTO sessions (token, user_id, created_at, expires_at)
+       VALUES ($1,$2,$3,$4)`,
+      [token, user.id, new Date().toISOString(), expiresAt.toISOString()]
+    );
 
     res.cookie(TOKEN_COOKIE_NAME, token, {
       httpOnly: true,
@@ -330,13 +418,11 @@ app.post("/auth/login", (req, res) => {
 });
 
 // Logout: clear cookie and remove session
-app.post("/auth/logout", (req, res) => {
+app.post("/auth/logout", async (req, res) => {
   try {
     const token = getAuthTokenFromRequest(req);
     if (token) {
-      const sessions = readSessions();
-      const filtered = sessions.filter((s) => s.token !== token);
-      writeSessions(filtered);
+      await pool.query("DELETE FROM sessions WHERE token = $1", [token]);
     }
     res.clearCookie(TOKEN_COOKIE_NAME);
     res.json({ success: true });
@@ -347,15 +433,14 @@ app.post("/auth/logout", (req, res) => {
 });
 
 // Forgot password: send code via email or phone (simulated)
-app.post("/auth/forgot-password", (req, res) => {
+app.post("/auth/forgot-password", async (req, res) => {
   try {
     const { email, phone } = req.body || {};
     if (!email && !phone) {
       return res.status(400).json({ error: "Email or phone is required" });
     }
 
-    const users = readUsers();
-    let user = null;
+    let userResult;
     let method = null;
 
     if (email) {
@@ -363,29 +448,33 @@ app.post("/auth/forgot-password", (req, res) => {
         return res.status(400).json({ error: "Invalid email format" });
       }
       const normalizedEmail = String(email).trim().toLowerCase();
-      user = users.find((u) => u.email === normalizedEmail);
+      userResult = await pool.query("SELECT * FROM users WHERE email = $1", [normalizedEmail]);
       method = "email";
     } else if (phone) {
       if (!isValidPhone(phone)) {
         return res.status(400).json({ error: "Invalid phone format" });
       }
       const normalizedPhone = String(phone).trim();
-      user = users.find((u) => u.phone === normalizedPhone);
+      userResult = await pool.query("SELECT * FROM users WHERE phone = $1", [normalizedPhone]);
       method = "sms";
     }
 
-    if (!user) {
+    if (!userResult || userResult.rowCount === 0) {
       // To avoid leaking which accounts exist, respond with generic message
       return res.json({ message: "Если учетная запись существует, то код был отправлен" });
     }
 
+    const user = userResult.rows[0];
+
     const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
 
-    user.resetCode = code;
-    user.resetCodeExpiresAt = expiresAt.toISOString();
-
-    writeUsers(users);
+    await pool.query(
+      `UPDATE users
+       SET reset_code = $1, reset_code_expires_at = $2
+       WHERE id = $3`,
+      [code, expiresAt.toISOString(), user.id]
+    );
 
     // Here you would actually send email or SMS. For now we log it.
     console.log(`Password reset code for user ${user.name} via ${method}: ${code}`);
@@ -398,7 +487,7 @@ app.post("/auth/forgot-password", (req, res) => {
 });
 
 // Reset password using code
-app.post("/auth/reset-password", (req, res) => {
+app.post("/auth/reset-password", async (req, res) => {
   try {
     const { name, code, newPassword } = req.body || {};
 
@@ -409,27 +498,36 @@ app.post("/auth/reset-password", (req, res) => {
       return res.status(400).json({ error: "newPassword must be at least 6 characters" });
     }
 
-    const users = readUsers();
-    const user = users.find((u) => u.name === String(name).trim());
-    if (!user || !user.resetCode || !user.resetCodeExpiresAt) {
+    const normalizedName = String(name).trim();
+    const userResult = await pool.query("SELECT * FROM users WHERE name = $1", [normalizedName]);
+    if (userResult.rowCount === 0) {
+      return res.status(400).json({ error: "Invalid code or user" });
+    }
+
+    const user = userResult.rows[0];
+
+    if (!user.reset_code || !user.reset_code_expires_at) {
       return res.status(400).json({ error: "Invalid code or user" });
     }
 
     const now = Date.now();
-    const expiresAt = new Date(user.resetCodeExpiresAt).getTime();
+    const expiresAt = new Date(user.reset_code_expires_at).getTime();
     if (now > expiresAt) {
       return res.status(400).json({ error: "Code has expired" });
     }
 
-    if (String(code).trim() !== String(user.resetCode).trim()) {
+    if (String(code).trim() !== String(user.reset_code).trim()) {
       return res.status(400).json({ error: "Invalid code" });
     }
 
-    user.passwordHash = hashPassword(newPassword);
-    user.resetCode = null;
-    user.resetCodeExpiresAt = null;
+    const newHash = hashPassword(newPassword);
 
-    writeUsers(users);
+    await pool.query(
+      `UPDATE users
+       SET password_hash = $1, reset_code = NULL, reset_code_expires_at = NULL
+       WHERE id = $2`,
+      [newHash, user.id]
+    );
 
     return res.json({ message: "Password has been reset" });
   } catch (err) {
@@ -448,14 +546,14 @@ app.get("/profile", authMiddleware, (req, res) => {
     name: user.name,
     email: user.email,
     phone: user.phone,
-    bestStreak: user.bestStreak,
-    currentStreak: user.currentStreak,
-    wrongWords: user.wrongWords || [],
+    bestStreak: user.best_streak ?? 0,
+    currentStreak: user.current_streak ?? 0,
+    wrongWords: Array.isArray(user.wrong_words) ? user.wrong_words : [],
   });
 });
 
 // Update stats after answer: correct or not, and which word
-app.post("/profile/answer", authMiddleware, (req, res) => {
+app.post("/profile/answer", authMiddleware, async (req, res) => {
   try {
     const { accent, correct } = req.body || {};
     if (typeof accent !== "string") {
@@ -465,35 +563,42 @@ app.post("/profile/answer", authMiddleware, (req, res) => {
       return res.status(400).json({ error: "correct must be boolean" });
     }
 
-    const users = readUsers();
-    const userIndex = users.findIndex((u) => u.id === req.user.id);
-    if (userIndex === -1) {
+    const userId = req.user.id;
+    const userResult = await pool.query("SELECT * FROM users WHERE id = $1", [userId]);
+    if (userResult.rowCount === 0) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const user = users[userIndex];
+    const user = userResult.rows[0];
+
+    let currentStreak = user.current_streak || 0;
+    let bestStreak = user.best_streak || 0;
+    let wrongWords = Array.isArray(user.wrong_words) ? user.wrong_words.slice() : [];
 
     if (correct) {
-      user.currentStreak = (user.currentStreak || 0) + 1;
-      if (!user.bestStreak || user.currentStreak > user.bestStreak) {
-        user.bestStreak = user.currentStreak;
+      currentStreak += 1;
+      if (!bestStreak || currentStreak > bestStreak) {
+        bestStreak = currentStreak;
       }
     } else {
-      user.currentStreak = 0;
+      currentStreak = 0;
       const word = accent.trim().toLowerCase();
-      user.wrongWords = Array.isArray(user.wrongWords) ? user.wrongWords : [];
-      if (!user.wrongWords.includes(word)) {
-        user.wrongWords.push(word);
+      if (!wrongWords.includes(word)) {
+        wrongWords.push(word);
       }
     }
 
-    users[userIndex] = user;
-    writeUsers(users);
+    await pool.query(
+      `UPDATE users
+       SET best_streak = $1, current_streak = $2, wrong_words = $3
+       WHERE id = $4`,
+      [bestStreak, currentStreak, wrongWords, userId]
+    );
 
     res.json({
-      bestStreak: user.bestStreak,
-      currentStreak: user.currentStreak,
-      wrongWords: user.wrongWords,
+      bestStreak,
+      currentStreak,
+      wrongWords,
     });
   } catch (err) {
     console.error(err);
